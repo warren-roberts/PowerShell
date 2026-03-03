@@ -132,31 +132,24 @@ foreach ($result in $rightsSearcher.FindAll()) {
 
 Write-Verbose "Schema/rights definitions loaded: $($GuidMap.Count) GUIDs"
 
-#
-# Enumerate target objects efficiently using DirectorySearcher (faster than Get-ADObject at scale)
-#
-$ldapFilter = if ($IncludeContainer) {
-    "(|(objectClass=container)(objectClass=organizationalUnit)(objectClass=domainDNS))"
-} else {
-    "(|(objectClass=organizationalUnit)(objectClass=domainDNS))"
+function Resolve-GuidName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [guid]$GuidValue,
+        [hashtable]$Map
+    )
+    if ($Map.ContainsKey($GuidValue)) { return $Map[$GuidValue] }
+    return $GuidValue.Guid
 }
-
-$enumSearcher = New-Object System.DirectoryServices.DirectorySearcher
-$enumSearcher.SearchRoot = [ADSI]"LDAP://$SearchBase"
-$enumSearcher.Filter = $ldapFilter
-$enumSearcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
-$enumSearcher.PageSize = 1000
-$enumSearcher.CacheResults = $false
-$enumSearcher.ServerTimeLimit = New-TimeSpan -Seconds 30
-[void]$enumSearcher.PropertiesToLoad.Add("distinguishedName")
-[void]$enumSearcher.PropertiesToLoad.Add("objectClass")
 
 # Optional: skip very noisy subtrees (DN prefix checks are cheap)
 # Adjust to taste or remove if you truly want everything under SearchBase.
-$skipPrefixes = @(
-    "CN=MicrosoftDNS,",   # can be huge
-    "CN=System,"          # busy/system-managed
-)
+if ($IncludeContainer){
+    $skipPrefixes = @(
+        "CN=MicrosoftDNS,",   # can be huge
+        "CN=System,"          # busy/system-managed
+    )
+}
 
 # Prepare CSV streaming if requested
 if ($OutFile) {
@@ -169,84 +162,107 @@ if ($OutFile) {
     $csvHeaderWritten = $false
 }
 
-function Resolve-GuidName {
-    param(
-        [Parameter(Mandatory = $true)]
-        [guid]$GuidValue,
-        [hashtable]$Map
-    )
-    if ($Map.ContainsKey($GuidValue)) { return $Map[$GuidValue] }
-    return $GuidValue.Guid
+#
+# Enumerate target objects efficiently using DirectorySearcher (faster than Get-ADObject at scale)
+#
+
+# Build ordered LDAP filters
+$filters = @()
+
+# Domain root FIRST
+$filters += "(objectClass=domainDNS)"
+
+# Then OUs
+$filters += "(objectClass=organizationalUnit)"
+
+# Then containers if requested
+if ($IncludeContainer) {
+    $filters += "(objectClass=container)"
 }
 
-# Enumerate and process
-foreach ($r in $enumSearcher.FindAll()) {
 
-    $dn = [string]$r.Properties["distinguishedname"][0]
-    if ([string]::IsNullOrWhiteSpace($dn)) { continue }
+foreach ($classFilter in $filters) {
 
-    # DN prefix skip (cheap) before Get-Acl (expensive)
-    if ($IncludeContainer)
-    {
-        $shouldSkip = $false
-        foreach ($p in $skipPrefixes) {
-            if ($dn.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $shouldSkip = $true
-                break
+    $enumSearcher = New-Object System.DirectoryServices.DirectorySearcher
+    $enumSearcher.SearchRoot = [ADSI]"LDAP://$SearchBase"
+    $enumSearcher.Filter = $classFilter
+    $enumSearcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+    $enumSearcher.PageSize = 1000
+    $enumSearcher.CacheResults = $false
+    $enumSearcher.ServerTimeLimit = New-TimeSpan -Seconds 30
+
+    [void]$enumSearcher.PropertiesToLoad.Add("distinguishedName")
+    [void]$enumSearcher.PropertiesToLoad.Add("objectClass")
+
+    # Enumerate and process
+    foreach ($r in $enumSearcher.FindAll()) {
+
+        $dn = [string]$r.Properties["distinguishedname"][0]
+        if ([string]::IsNullOrWhiteSpace($dn)) { continue }
+
+        # DN prefix skip (cheap) before Get-Acl (expensive)
+        if ($IncludeContainer)
+        {
+            $shouldSkip = $false
+            foreach ($p in $skipPrefixes) {
+                if ($dn.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $shouldSkip = $true
+                    break
+                }
             }
-        }
-        if ($shouldSkip) { continue }
-    }
-
-    # objectClass is multivalued; last element is typically the most specific
-    $objectClass = $null
-    if ($r.Properties["objectclass"] -and $r.Properties["objectclass"].Count -gt 0) {
-        $objectClass = [string]$r.Properties["objectclass"][$r.Properties["objectclass"].Count - 1]
-    }
-
-    try {
-        $acl = Get-Acl "AD:$dn" -Audit
-    }
-    catch {
-        Write-Warning "Failed to read SACL for $dn : $($_.Exception.Message)"
-        continue
-    }
-
-    foreach ($sace in $acl.Audit) {
-
-        if (-not $IncludeInherited -and $sace.IsInherited) { continue }
-
-        # These are GUIDs
-        $ot  = [guid]$sace.ObjectType
-        $iot = [guid]$sace.InheritedObjectType
-
-        $row = [PSCustomObject]@{
-            DN                      = $dn
-            ObjectClass             = $objectClass
-            IdentityReference       = $sace.IdentityReference.Value
-            ActiveDirectoryRights   = $sace.ActiveDirectoryRights
-            AuditFlags              = $sace.AuditFlags
-            ObjectType              = $ot
-            ObjectTypeName          = Resolve-GuidName -GuidValue $ot  -Map $GuidMap
-            InheritedObjectType     = $iot
-            InheritedObjectTypeName = Resolve-GuidName -GuidValue $iot -Map $GuidMap
-            InheritanceType         = $sace.InheritanceType
-            InheritanceFlags        = $sace.InheritanceFlags
-            PropagationFlags        = $sace.PropagationFlags
-            IsInherited             = $sace.IsInherited
+            if ($shouldSkip) { continue }
         }
 
-        if ($OutFile) {
-            if (-not $csvHeaderWritten) {
-                $row | Export-Csv -Path $OutFile -NoTypeInformation
-                $csvHeaderWritten = $true
-            } else {
-                $row | Export-Csv -Path $OutFile -NoTypeInformation -Append
+        # objectClass is multivalued; last element is typically the most specific
+        $objectClass = $null
+        if ($r.Properties["objectclass"] -and $r.Properties["objectclass"].Count -gt 0) {
+            $objectClass = [string]$r.Properties["objectclass"][$r.Properties["objectclass"].Count - 1]
+        }
+
+        try {
+            $acl = Get-Acl "AD:$dn" -Audit
+        }
+        catch {
+            Write-Warning "Failed to read SACL for $dn : $($_.Exception.Message)"
+            continue
+        }
+
+        foreach ($sace in $acl.Audit) {
+
+            if (-not $IncludeInherited -and $sace.IsInherited) { continue }
+
+            # These are GUIDs
+            $ot  = [guid]$sace.ObjectType
+            $iot = [guid]$sace.InheritedObjectType
+
+            $row = [PSCustomObject]@{
+                DN                      = $dn
+                ObjectClass             = $objectClass
+                IdentityReference       = $sace.IdentityReference.Value
+                ActiveDirectoryRights   = $sace.ActiveDirectoryRights
+                AuditFlags              = $sace.AuditFlags
+                ObjectType              = $ot
+                ObjectTypeName          = Resolve-GuidName -GuidValue $ot  -Map $GuidMap
+                InheritedObjectType     = $iot
+                InheritedObjectTypeName = Resolve-GuidName -GuidValue $iot -Map $GuidMap
+                InheritanceType         = $sace.InheritanceType
+                InheritanceFlags        = $sace.InheritanceFlags
+                PropagationFlags        = $sace.PropagationFlags
+                IsInherited             = $sace.IsInherited
             }
-        }
-        else {
-            # Stream to pipeline (no big in-memory array)
-            $row
+
+            if ($OutFile) {
+                if (-not $csvHeaderWritten) {
+                    $row | Export-Csv -Path $OutFile -NoTypeInformation
+                    $csvHeaderWritten = $true
+                } else {
+                    $row | Export-Csv -Path $OutFile -NoTypeInformation -Append
+                }
+            }
+            else {
+                # Stream to pipeline (no big in-memory array)
+                $row
+            }
         }
     }
 }
